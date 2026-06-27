@@ -57,7 +57,22 @@ __global__ void flash_attn_kernel(
     int   N,
     float scale
 ) {
-    // Block 4: shared memory layout
+    // ── Block 4: shared memory + thread/position setup ───────────────────────
+    extern __shared__ float smem[];
+    float* K_tile = smem;
+    float* V_tile = smem + TILE_SIZE * HEAD_DIM;
+
+    const int bh    = blockIdx.x;
+    const int q_idx = blockIdx.y * BLOCK_SIZE + threadIdx.x;
+    const int tid   = threadIdx.x;
+
+    if (q_idx >= N) return;
+
+    const float* Q_bh = Q + bh * N * HEAD_DIM;
+    const float* K_bh = K + bh * N * HEAD_DIM;
+    const float* V_bh = V + bh * N * HEAD_DIM;
+    float*       O_bh = O + bh * N * HEAD_DIM;
+
     // Block 5: load Q into registers
     // Block 6: initialize accumulators
     // Block 7: tile loop
