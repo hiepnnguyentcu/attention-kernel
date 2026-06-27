@@ -84,6 +84,54 @@ __global__ void flash_attn_kernel(
     float l = 0.0f;
     float o_reg[HEAD_DIM] = {};
 
-    // Block 7: tile loop
+    // ── Block 7: tile loop ────────────────────────────────────────────────────
+    for (int tile_start = 0; tile_start < N; tile_start += TILE_SIZE) {
+        const int tile_len = min(TILE_SIZE, N - tile_start);
+
+        // 7a+7b: all threads in the block cooperate to load one K tile and one V tile
+        for (int i = tid; i < TILE_SIZE * HEAD_DIM; i += BLOCK_SIZE) {
+            const int row        = i / HEAD_DIM;
+            const int col        = i % HEAD_DIM;
+            const int global_row = tile_start + row;
+            K_tile[i] = (global_row < N) ? K_bh[global_row * HEAD_DIM + col] : 0.0f;
+            V_tile[i] = (global_row < N) ? V_bh[global_row * HEAD_DIM + col] : 0.0f;
+        }
+        __syncthreads();
+
+        // 7c: each thread computes dot(q_reg, K_tile[j]) for every key in the tile
+        float scores[TILE_SIZE];
+        for (int j = 0; j < tile_len; j++) {
+            float dot = 0.0f;
+            for (int d = 0; d < HEAD_DIM; d++)
+                dot += q_reg[d] * K_tile[j * HEAD_DIM + d];
+            scores[j] = dot * scale;
+        }
+
+        // 7d: online softmax — find new max across this tile's scores
+        float m_new = m;
+        for (int j = 0; j < tile_len; j++)
+            m_new = fmaxf(m_new, scores[j]);
+
+        // 7d: rescale old accumulations to the new max, then fold in this tile
+        const float exp_diff = expf(m - m_new);
+        float l_new = l * exp_diff;
+
+        for (int d = 0; d < HEAD_DIM; d++)
+            o_reg[d] *= exp_diff;
+
+        for (int j = 0; j < tile_len; j++) {
+            const float p = expf(scores[j] - m_new);
+            l_new += p;
+            for (int d = 0; d < HEAD_DIM; d++)
+                o_reg[d] += p * V_tile[j * HEAD_DIM + d];
+        }
+
+        m = m_new;
+        l = l_new;
+
+        // 7e: barrier before the next tile overwrites shared memory
+        __syncthreads();
+    }
+
     // Block 8: finalize and write output
 }
