@@ -11,13 +11,15 @@ __global__ void flash_attn_kernel(
     const float* __restrict__ V,
     float*       __restrict__ O,
     int   N,
-    float scale
+    float scale,
+    bool  causal
 );
 
 torch::Tensor flash_attention_forward(
     torch::Tensor Q,
     torch::Tensor K,
-    torch::Tensor V
+    torch::Tensor V,
+    bool causal
 ) {
     const int B = Q.size(0);
     const int H = Q.size(1);
@@ -37,7 +39,8 @@ torch::Tensor flash_attention_forward(
         V.data_ptr<float>(),
         O.data_ptr<float>(),
         N,
-        scale
+        scale,
+        causal
     );
 
     TORCH_CHECK(
@@ -55,7 +58,8 @@ __global__ void flash_attn_kernel(
     const float* __restrict__ V,
     float*       __restrict__ O,
     int   N,
-    float scale
+    float scale,
+    bool  causal
 ) {
     // ── Block 4: shared memory + thread/position setup ───────────────────────
     extern __shared__ float smem[];
@@ -85,7 +89,11 @@ __global__ void flash_attn_kernel(
     float o_reg[HEAD_DIM] = {};
 
     // ── Block 7: tile loop ────────────────────────────────────────────────────
+    const int q_max_in_block = blockIdx.y * BLOCK_SIZE + (BLOCK_SIZE - 1);
+
     for (int tile_start = 0; tile_start < N; tile_start += TILE_SIZE) {
+        if (causal && tile_start > q_max_in_block) break;
+
         const int tile_len = min(TILE_SIZE, N - tile_start);
 
         // 7a+7b: all threads in the block cooperate to load one K tile and one V tile
@@ -104,7 +112,7 @@ __global__ void flash_attn_kernel(
             float dot = 0.0f;
             for (int d = 0; d < HEAD_DIM; d++)
                 dot += q_reg[d] * K_tile[j * HEAD_DIM + d];
-            scores[j] = dot * scale;
+            scores[j] = (causal && (tile_start + j) > q_idx) ? -INFINITY : dot * scale;
         }
 
         // 7d: online softmax — find new max across this tile's scores

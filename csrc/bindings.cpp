@@ -3,13 +3,15 @@
 torch::Tensor flash_attention_forward(
     torch::Tensor Q,
     torch::Tensor K,
-    torch::Tensor V
+    torch::Tensor V,
+    bool causal
 );
 
 torch::Tensor attention_forward(
     torch::Tensor Q,
     torch::Tensor K,
-    torch::Tensor V
+    torch::Tensor V,
+    bool causal = false
 ) {
     TORCH_CHECK(Q.is_cuda(), "Q must be a CUDA tensor");
     TORCH_CHECK(K.is_cuda(), "K must be a CUDA tensor");
@@ -32,9 +34,10 @@ torch::Tensor attention_forward(
     TORCH_CHECK(Q.size(2) == K.size(2) && Q.size(2) == V.size(2), "Seq length mismatch");
     TORCH_CHECK(Q.size(3) == K.size(3) && Q.size(3) == V.size(3), "Head dim mismatch");
 
-    return flash_attention_forward(Q, K, V);
+    return flash_attention_forward(Q, K, V, causal);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("forward", &attention_forward, "Tiled flash attention forward pass (CUDA)");
+    m.def("forward", &attention_forward, "Tiled flash attention forward pass (CUDA)",
+          py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("causal") = false);
 }

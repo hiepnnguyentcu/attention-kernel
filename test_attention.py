@@ -19,7 +19,13 @@ out_naive = naive_attention(Q, K, V)
 
 match    = torch.allclose(out_ours, out_ref, atol=1e-3)
 max_err  = (out_ours - out_ref).abs().max().item()
-print(f"Correctness: {'PASS' if match else 'FAIL'}  (max error: {max_err:.6f})")
+print(f"Correctness (non-causal): {'PASS' if match else 'FAIL'}  (max error: {max_err:.6f})")
+
+out_causal_ours = attention_kernel.forward(Q.contiguous(), K.contiguous(), V.contiguous(), causal=True)
+out_causal_ref  = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
+match_c   = torch.allclose(out_causal_ours, out_causal_ref, atol=1e-3)
+max_err_c = (out_causal_ours - out_causal_ref).abs().max().item()
+print(f"Correctness (causal):     {'PASS' if match_c else 'FAIL'}  (max error: {max_err_c:.6f})")
 
 # ── Benchmark ─────────────────────────────────────────────────────────────────
 def bench(fn, label, iters=200):
@@ -37,6 +43,7 @@ def bench(fn, label, iters=200):
     print(f"{label:30s}  {ms:.3f} ms")
 
 print()
-bench(lambda: naive_attention(Q, K, V),                                                "naive (O(N²) memory)")
-bench(lambda: attention_kernel.forward(Q.contiguous(), K.contiguous(), V.contiguous()), "ours (tiled)")
-bench(lambda: F.scaled_dot_product_attention(Q, K, V),                                 "pytorch sdpa")
+bench(lambda: naive_attention(Q, K, V),                                                          "naive (O(N²) memory)")
+bench(lambda: attention_kernel.forward(Q.contiguous(), K.contiguous(), V.contiguous()),          "ours (tiled)")
+bench(lambda: attention_kernel.forward(Q.contiguous(), K.contiguous(), V.contiguous(), True),    "ours (causal)")
+bench(lambda: F.scaled_dot_product_attention(Q, K, V),                                          "pytorch sdpa")
