@@ -28,7 +28,7 @@ max_err_c = (out_causal_ours - out_causal_ref).abs().max().item()
 print(f"Correctness (causal):     {'PASS' if match_c else 'FAIL'}  (max error: {max_err_c:.6f})")
 
 # ── Benchmark ─────────────────────────────────────────────────────────────────
-def bench(fn, label, iters=200):
+def bench(fn, label, iters=200, silent=False):
     for _ in range(10):
         fn()
     torch.cuda.synchronize()
@@ -40,10 +40,21 @@ def bench(fn, label, iters=200):
     end.record()
     torch.cuda.synchronize()
     ms = start.elapsed_time(end) / iters
-    print(f"{label:30s}  {ms:.3f} ms")
+    if not silent:
+        print(f"{label:30s}  {ms:.3f} ms")
+    return ms
 
 print()
-bench(lambda: naive_attention(Q, K, V),                                                          "naive (O(N²) memory)")
-bench(lambda: attention_kernel.forward(Q.contiguous(), K.contiguous(), V.contiguous()),          "ours (tiled)")
-bench(lambda: attention_kernel.forward(Q.contiguous(), K.contiguous(), V.contiguous(), True),    "ours (causal)")
-bench(lambda: F.scaled_dot_product_attention(Q, K, V),                                          "pytorch sdpa")
+print(f"{'N':>6}  {'naive':>10}  {'ours':>10}  {'ours causal':>12}  {'pytorch sdpa':>13}")
+print("-" * 60)
+for N_test in [128, 256, 512, 1024, 2048]:
+    Q_ = torch.randn(B, H, N_test, D, device="cuda")
+    K_ = torch.randn(B, H, N_test, D, device="cuda")
+    V_ = torch.randn(B, H, N_test, D, device="cuda")
+    Qc, Kc, Vc = Q_.contiguous(), K_.contiguous(), V_.contiguous()
+
+    t_naive  = bench(lambda: naive_attention(Q_, K_, V_),                          "", iters=100, silent=True)
+    t_ours   = bench(lambda: attention_kernel.forward(Qc, Kc, Vc),                 "", iters=100, silent=True)
+    t_causal = bench(lambda: attention_kernel.forward(Qc, Kc, Vc, True),           "", iters=100, silent=True)
+    t_sdpa   = bench(lambda: F.scaled_dot_product_attention(Q_, K_, V_),           "", iters=100, silent=True)
+    print(f"{N_test:>6}  {t_naive:>9.3f}ms  {t_ours:>9.3f}ms  {t_causal:>11.3f}ms  {t_sdpa:>12.3f}ms")
