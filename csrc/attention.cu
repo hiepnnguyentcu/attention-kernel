@@ -77,11 +77,12 @@ __global__ void flash_attn_kernel(
     const float* V_bh = V + bh * N * HEAD_DIM;
     float*       O_bh = O + bh * N * HEAD_DIM;
 
-    // ── Block 5: load Q into registers ───────────────────────────────────────
+    // ── Block 5: load Q into registers (float4 — 4 floats per instruction) ──
     float q_reg[HEAD_DIM];
-    const float* q_ptr = Q_bh + q_idx * HEAD_DIM;
-    for (int i = 0; i < HEAD_DIM; i++)
-        q_reg[i] = q_ptr[i];
+    const float4* q_ptr4 = reinterpret_cast<const float4*>(Q_bh + q_idx * HEAD_DIM);
+    float4*       q_reg4 = reinterpret_cast<float4*>(q_reg);
+    for (int i = 0; i < HEAD_DIM / 4; i++)
+        q_reg4[i] = q_ptr4[i];
 
     // ── Block 6: initialize accumulators ─────────────────────────────────────
     float m = -INFINITY;
@@ -96,13 +97,19 @@ __global__ void flash_attn_kernel(
 
         const int tile_len = min(TILE_SIZE, N - tile_start);
 
-        // 7a+7b: all threads in the block cooperate to load one K tile and one V tile
-        for (int i = tid; i < TILE_SIZE * HEAD_DIM; i += BLOCK_SIZE) {
-            const int row        = i / HEAD_DIM;
-            const int col        = i % HEAD_DIM;
+        // 7a+7b: cooperatively load K and V tiles using float4 (128-bit loads)
+        const int     cols_f4 = HEAD_DIM / 4;
+        float4*       K_tile4 = reinterpret_cast<float4*>(K_tile);
+        float4*       V_tile4 = reinterpret_cast<float4*>(V_tile);
+        const float4* K_bh4   = reinterpret_cast<const float4*>(K_bh);
+        const float4* V_bh4   = reinterpret_cast<const float4*>(V_bh);
+        const float4  zero    = make_float4(0.f, 0.f, 0.f, 0.f);
+        for (int i4 = tid; i4 < TILE_SIZE * cols_f4; i4 += BLOCK_SIZE) {
+            const int row        = i4 / cols_f4;
+            const int col        = i4 % cols_f4;
             const int global_row = tile_start + row;
-            K_tile[i] = (global_row < N) ? K_bh[global_row * HEAD_DIM + col] : 0.0f;
-            V_tile[i] = (global_row < N) ? V_bh[global_row * HEAD_DIM + col] : 0.0f;
+            K_tile4[i4] = (global_row < N) ? K_bh4[global_row * cols_f4 + col] : zero;
+            V_tile4[i4] = (global_row < N) ? V_bh4[global_row * cols_f4 + col] : zero;
         }
         __syncthreads();
 
