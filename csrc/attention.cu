@@ -79,7 +79,11 @@ __global__ void flash_attn_kernel(
     for (int i = 0; i < HEAD_DIM; i++)
         q_reg[i] = q_ptr[i];
 
-    // Block 6: initialize accumulators
+    // ── Block 6: initialize accumulators ─────────────────────────────────────
+    float m = -INFINITY;
+    float l = 0.0f;
+    float o_reg[HEAD_DIM] = {};
+
     // Block 7: tile loop
     // Block 8: finalize and write output
 }
