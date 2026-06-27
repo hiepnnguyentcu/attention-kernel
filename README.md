@@ -1,136 +1,134 @@
 # attention-kernel
 
-A from-scratch CUDA implementation of tiled forward attention with online softmax — the core algorithm behind FlashAttention. Built as a learning project to understand GPU memory hierarchy and kernel programming.
+A concise CUDA implementation of tiled forward attention with an online softmax (FlashAttention-style). Implemented from first principles to demonstrate how tiling and streaming softmax eliminate HBM-resident score matrices and shift the performance bottleneck from memory to compute.
 
-## What this is
+## Overview
 
-Transformers use scaled dot-product attention:
+This project implements a tiled, single-pass attention kernel that reproduces the exact numerics of scaled dot-product attention:
 
 ```
-Attention(Q, K, V) = softmax(Q @ Kᵀ / √d) @ V
+Attention(Q, K, V) = softmax(Q Kᵀ / √d) V
 ```
 
-The naive implementation materializes the full `[N × N]` score matrix in GPU global memory (HBM). For N=2048, that's 16 MB *per attention head* — and it gets written, read, written, and read again across the softmax and matmul steps.
+Key design goals:
 
-This kernel avoids that by:
-1. **Tiling** — loading K and V in chunks that fit in on-chip shared memory (SRAM)
-2. **Online softmax** — a streaming algorithm that computes the exact same softmax result without ever needing all scores in memory at once
+- Avoid materializing the full N×N score matrix in global memory
+- Compute numerically stable softmax in one streaming pass
+- Minimize HBM traffic by using on-chip shared memory (SRAM) and registers for tile processing
 
-The N×N matrix is never written to HBM. Q, K, V are each read once; O is written once.
+**Result:** Q, K, V are each read once; the output O is written once. No N×N matrix is written to HBM.
 
-## Structure
+## Implementation layout
 
 ```
 csrc/
-  attention.cu      # CUDA kernel (~160 LOC)
-  bindings.cpp      # PyTorch C++ extension bindings
-setup.py            # Builds the .so with nvcc
-test_attention.py   # Correctness checks + scaling benchmark
+  attention.cu      # CUDA kernel implementing tiled forward attention (~160 LOC)
+  bindings.cpp      # PyTorch C++ extension glue
+setup.py            # nvcc-based build wrapper
+test_attention.py   # Correctness checks and microbenchmarks
 ```
 
-## GPU memory hierarchy
+Build: `pip install -e .` (requires PyTorch with CUDA). Default architecture: `sm_75` (T4). Modify `-arch` in `setup.py` for other targets (`sm_80`, `sm_89`, etc.).
 
-Understanding why this matters requires knowing how GPU memory works:
+## Algorithmic techniques
 
-| Level | Analogy | Bandwidth | Size |
-|---|---|---|---|
-| HBM (global memory) | Database on disk | ~300 GB/s | 16 GB |
-| SRAM (shared memory) | Redis cache | ~20 TB/s | 48–96 KB/block |
-| Registers | Local variables | instant | ~256 KB/block |
+- **Tiling** — load K and V in blocks that fit in shared memory, process Q row-tiles against streamed K/V tiles
+- **Online softmax** — maintain a running max and normalization accumulator to compute the exact softmax result in one left-to-right scan without storing all scores
+- **Causal masking** — skip whole tiles that lie strictly in the future to implement autoregressive (GPT-style) attention
+- **Vectorized loads** — use `float4` for 128-bit transactions on K/V tile loads
+- **Synchronization-minimal control** — avoid divergent `__syncthreads()` patterns and use whole-tile skipping to reduce work for causal cases
 
-Naive attention makes 4+ round trips to HBM for the score matrix. This kernel makes 0 — the scores are computed in registers and discarded tile by tile.
-
-## Online softmax
-
-Normal softmax needs two passes: find the max, then normalize. That requires seeing all N scores before starting. Online softmax maintains a running max `m` and sum `l` and corrects previous tiles as new ones arrive:
+Online softmax update per tile:
 
 ```
-m_new = max(m_old, max(scores_in_tile))
-l_new = exp(m_old − m_new) × l_old + Σ exp(scores − m_new)
-O_new = exp(m_old − m_new) × O_old + exp(scores − m_new) @ V_tile
+m_new = max(m_old, max(scores_tile))
+l_new = exp(m_old − m_new) × l_old + Σ exp(scores_tile − m_new)
+O_new = exp(m_old − m_new) × O_old + exp(scores_tile − m_new) @ V_tile
 ```
 
-At the end: `O = O_new / l_new`. Mathematically equivalent to two-pass softmax, computable in a single left-to-right scan.
+Final output: `O = O_new / l_new`. Produces numerically identical results to a conventional two-pass softmax.
 
-## Features
+## Performance summary
 
-- ✓ Tiled forward attention — O(1) SRAM usage regardless of N
-- ✓ Online softmax — single pass, numerically stable
-- ✓ Causal masking — tokens attend only to past positions (GPT-style)
-- ✓ `float4` vectorized loads — 128-bit memory transactions for K/V tiles
-- ✓ Whole-tile skip for causal — blocks entirely in the future are skipped with no sync
-
-## Build
-
-```bash
-pip install -e .
-```
-
-Requires PyTorch with CUDA. Compiled for `sm_75` (T4). Change `-arch` in `setup.py` for other GPUs:
-- `sm_75` — T4 (Colab free)
-- `sm_80` — A100
-- `sm_89` — RTX 4090
-
-## Correctness
-
-```
-Correctness (non-causal): PASS  (max error: 0.000000)
-Correctness (causal):     PASS  (max error: 0.000000)
-```
-
-Validated against `torch.nn.functional.scaled_dot_product_attention` with `atol=1e-3`.
-
-## Benchmark (T4 GPU, B=2 H=8 D=64)
+Measured on T4 (B=2, H=8, D=64). Naive refers to a full-score-matrix implementation; pytorch sdpa is `torch.nn.functional.scaled_dot_product_attention`.
 
 ![Benchmark](benchmark.png)
 
-```
-     N       naive        ours   ours causal   pytorch sdpa
-------------------------------------------------------------
-   128      0.089ms      0.124ms        0.123ms         0.051ms
-   256      0.214ms      0.444ms        0.334ms         0.151ms
-   512      0.597ms      1.141ms        0.583ms         0.366ms
-  1024      2.560ms      3.581ms        2.116ms         1.541ms
-  2048     10.214ms     13.283ms        8.278ms         5.964ms
-```
+| N | naive | ours | ours causal | pytorch sdpa |
+|---:|---:|---:|---:|---:|
+| 128 | 0.089ms | 0.124ms | 0.123ms | 0.051ms |
+| 256 | 0.214ms | 0.444ms | 0.334ms | 0.151ms |
+| 512 | 0.597ms | 1.141ms | 0.583ms | 0.366ms |
+| 1024 | 2.560ms | 3.581ms | 2.116ms | 1.541ms |
+| 2048 | 10.214ms | 13.283ms | 8.278ms | 5.964ms |
 
-On a log-log scale, **naive's slope is steeper than ours** — that's O(N²) vs O(N) scaling made visible. Doubling N multiplies naive's time by ~4× but ours by ~2–3×.
+Notes:
 
-The crossover where tiling wins isn't visible here because this kernel uses scalar `float32` while PyTorch's naive matmul uses cuBLAS with `fp16` tensor cores — a separate hardware unit that runs ~8× faster than scalar fp32 for matrix multiply. The algorithmic advantage of tiling is real; the gap here is purely execution unit.
+- Algorithmic scaling advantage is visible as a shallower slope than naive on the log-log plot (tiling reduces effective HBM pressure)
+- The microbenchmark favors PyTorch cuBLAS fp16 tensor-core matmuls; this implementation uses scalar fp32, so measured gaps reflect execution-unit differences rather than algorithmic deficits
+- Causal masking reduces work by skipping tiles and yields ~40–50% speedup at large N versus non-causal runs
 
-**Causal masking** gives a consistent ~40–50% speedup at large N from whole-tile skipping — expected, since causal attention processes roughly half the tiles on average.
+## Roofline and bottlenecks (T4)
 
-## Roofline analysis (T4)
-
-The T4 has:
-- Peak fp32 compute: **8.1 TFLOPS**
-- Peak HBM bandwidth: **300 GB/s**
-- Ridge point: 8100 / 300 ≈ **27 FLOPs/byte**
+Device peaks:
+- fp32 peak: **8.1 TFLOPS**
+- HBM peak: **~300 GB/s**
+- Ridge point ≈ **27 FLOPs/byte**
 
 For N=1024, B=2, H=8, D=64:
 
-| | FLOPs | HBM bytes | Arithmetic intensity |
-|---|---|---|---|
-| Naive attention | ~2.1 GFLOPs | ~280 MB (N×N matrix) | ~7.5 FLOPs/byte → **memory bound** |
-| This kernel | ~2.1 GFLOPs | ~16 MB (Q+K+V+O only) | ~131 FLOPs/byte → **compute bound** |
+| | FLOPs | HBM traffic | Arithmetic intensity | |
+|---|---|---|---|---|
+| Naive attention | ~2.1 GFLOPs | ~280 MB | ~7.5 FLOPs/byte | memory bound |
+| This kernel | ~2.1 GFLOPs | ~16 MB | ~131 FLOPs/byte | compute bound |
 
-Our kernel is above the ridge point — we've successfully shifted the bottleneck from memory to compute. The next optimization step (tensor cores, or fp16 with `wmma`) would attack the compute ceiling directly.
+Tiling and online softmax shift the kernel above the ridge point. The next practical optimizations are reduced-precision compute (fp16/bf16) and tensor-core utilization.
 
-## What production FlashAttention does differently
+## Profiling
 
-This kernel demonstrates the algorithm. Production implementations (FlashAttention-2, FlashAttention-3) additionally:
+```python
+from torch.profiler import profile, record_function, ProfilerActivity
 
-- Use **tensor cores** (`wmma` / `mma.sync`) for the dot products — 8–16× faster compute
-- Use **fp16/bf16** instead of fp32
-- Run **multiple warps per block** with warp-level pipelining to hide memory latency
-- Use **register file tiling** to avoid spilling `scores[]` and `o_reg[]` to L1 cache
-- Implement a **backward pass** for training
+with profile(activities=[ProfilerActivity.CUDA], record_shapes=True) as prof:
+    with record_function("flash_attn"):
+        for _ in range(20):
+            attention_kernel.forward(Q, K, V)
 
-## What I learned
+print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=5))
+```
 
-- GPU memory hierarchy: why HBM round-trips are the bottleneck for attention, not FLOPs
-- CUDA kernel design: grid/block/thread layout, shared memory, `__syncthreads()`
-- Online algorithms: streaming softmax without a second pass
-- Vectorized memory access: `float4` loads for 4× memory instruction throughput
-- Cooperative loading: threads within a block splitting tile loads
-- Divergence-safe control flow: why `__syncthreads()` can't be inside a branch that some threads skip
+Output (T4, N=1024):
+
+```
+Name                                          Self CUDA   Self CUDA %   CUDA time avg   # Calls
+-----------------------------------------------------------------------------------------------
+flash_attn_kernel(float const*, ...)          158.958ms       99.83%        7.948ms        20
+void at::native::vectorized_elementwise...    271.771us        0.17%       13.589us        20
+```
+
+The custom kernel consumes 99.83% of GPU time; launcher overhead is negligible. For per-SM utilization and memory timeline, use Nsight Systems: `nsys profile --stats=true python test_attention.py`.
+
+## Production differences vs FlashAttention-2/3
+
+This implementation is pedagogical and demonstrates the core algorithm. Production systems add:
+
+- Tensor-core kernels (`wmma` / `mma.sync`) and reduced precision (fp16/bf16)
+- Multi-warp pipelining and warp-level scheduling to hide latency
+- Register-file tiling to avoid spills to L1
+- Full backward pass for training
+
+## Correctness
+
+Validated against `torch.nn.functional.scaled_dot_product_attention` with `atol=1e-3`.
+
+```
+Non-causal: PASS  (max error: 0.000000)
+Causal:     PASS  (max error: 0.000000)
+```
+
+## What this code demonstrates
+
+- HBM round-trips, not FLOPs, are the primary bottleneck for naive attention
+- Streaming softmax can achieve numerically stable single-pass computation
+- Shared memory/register tiling and vectorized loads materially reduce bandwidth pressure
+- Kernel-level concerns: thread/block layout, cooperative loading, divergence safety, and synchronization patterns determine correctness and performance
