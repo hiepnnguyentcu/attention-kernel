@@ -133,5 +133,9 @@ __global__ void flash_attn_kernel(
         __syncthreads();
     }
 
-    // Block 8: finalize and write output
+    // ── Block 8: finalize and write output ───────────────────────────────────
+    const float inv_l = 1.0f / l;
+    float* out_ptr = O_bh + q_idx * HEAD_DIM;
+    for (int d = 0; d < HEAD_DIM; d++)
+        out_ptr[d] = o_reg[d] * inv_l;
 }
