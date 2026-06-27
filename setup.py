@@ -14,7 +14,7 @@ setup(
                 "cxx": ["-O2"],
                 "nvcc": [
                     "-O2",
-                    "-arch=sm_80",            
+                    "-arch=sm_75",
                     "--use_fast_math",        
                     "-lineinfo",              
                 ],
