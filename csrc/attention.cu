@@ -73,7 +73,12 @@ __global__ void flash_attn_kernel(
     const float* V_bh = V + bh * N * HEAD_DIM;
     float*       O_bh = O + bh * N * HEAD_DIM;
 
-    // Block 5: load Q into registers
+    // ── Block 5: load Q into registers ───────────────────────────────────────
+    float q_reg[HEAD_DIM];
+    const float* q_ptr = Q_bh + q_idx * HEAD_DIM;
+    for (int i = 0; i < HEAD_DIM; i++)
+        q_reg[i] = q_ptr[i];
+
     // Block 6: initialize accumulators
     // Block 7: tile loop
     // Block 8: finalize and write output
