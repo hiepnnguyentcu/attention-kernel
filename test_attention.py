@@ -7,12 +7,18 @@ Q = torch.randn(B, H, N, D, device="cuda")
 K = torch.randn(B, H, N, D, device="cuda")
 V = torch.randn(B, H, N, D, device="cuda")
 
-# ── Correctness ───────────────────────────────────────────────────────────────
-out_ours = attention_kernel.forward(Q.contiguous(), K.contiguous(), V.contiguous())
-out_ref  = F.scaled_dot_product_attention(Q, K, V)
+def naive_attention(Q, K, V):
+    scale = Q.size(-1) ** -0.5
+    scores = torch.matmul(Q, K.transpose(-2, -1)) * scale  # [B, H, N, N] — full matrix in HBM
+    return torch.matmul(torch.softmax(scores, dim=-1), V)
 
-match = torch.allclose(out_ours, out_ref, atol=1e-3)
-max_err = (out_ours - out_ref).abs().max().item()
+# ── Correctness ───────────────────────────────────────────────────────────────
+out_ours  = attention_kernel.forward(Q.contiguous(), K.contiguous(), V.contiguous())
+out_ref   = F.scaled_dot_product_attention(Q, K, V)
+out_naive = naive_attention(Q, K, V)
+
+match    = torch.allclose(out_ours, out_ref, atol=1e-3)
+max_err  = (out_ours - out_ref).abs().max().item()
 print(f"Correctness: {'PASS' if match else 'FAIL'}  (max error: {max_err:.6f})")
 
 # ── Benchmark ─────────────────────────────────────────────────────────────────
@@ -30,7 +36,7 @@ def bench(fn, label, iters=200):
     ms = start.elapsed_time(end) / iters
     print(f"{label:30s}  {ms:.3f} ms")
 
-bench(lambda: attention_kernel.forward(Q.contiguous(), K.contiguous(), V.contiguous()),
-      "ours")
-bench(lambda: F.scaled_dot_product_attention(Q, K, V),
-      "pytorch sdpa")
+print()
+bench(lambda: naive_attention(Q, K, V),                                                "naive (O(N²) memory)")
+bench(lambda: attention_kernel.forward(Q.contiguous(), K.contiguous(), V.contiguous()), "ours (tiled)")
+bench(lambda: F.scaled_dot_product_attention(Q, K, V),                                 "pytorch sdpa")
