@@ -7,8 +7,8 @@ setup(
         CUDAExtension(
             name="attention_kernel",          
             sources=[
-                "csrc/attention.cu",          
-                "csrc/attention.cpp",         
+                "csrc/attention.cu",
+                "csrc/bindings.cpp",
             ],
             extra_compile_args={
                 "cxx": ["-O2"],
